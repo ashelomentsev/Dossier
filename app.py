@@ -82,7 +82,7 @@ updater = Updater(token=TOKEN, use_context=True)
 openai.api_key = os.environ.get('OPENAI_KEY')
 
 # Replace 'YOUR_WEBHOOK_URL' with the actual webhook URL
-WEBHOOK_POST_URL = "https://hook.eu1.make.com/t9wp8smpr6gm98y5pxjxf83ivvnppweq"
+# WEBHOOK_POST_URL = "https://hook.eu1.make.com/t9wp8smpr6gm98y5pxjxf83ivvnppweq"
 
 # Configure logging
 logging.basicConfig(
@@ -425,7 +425,7 @@ def main() -> None:
         listen="0.0.0.0",
         port=int(PORT),
         url_path=TOKEN,
-        webhook_url='https://talent-72e470935272.herokuapp.com/' + TOKEN
+        webhook_url='https://dossier-05f21382d3b0.herokuapp.com/' + TOKEN
     )
 
     updater.idle()
