@@ -1,203 +1,161 @@
 import os
-from telegram import Update, Voice, Document
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+
 import openai
 import time
-import psycopg2
-import base64
 from pydub import AudioSegment
-from flask import Flask, render_template
-# from flask_socketio import SocketIO, emit
-from flask_sqlalchemy import SQLAlchemy
-from urllib.parse import urlparse, urlunparse
-from datetime import datetime
+from flask import Flask, request
+import uuid
+import xml.etree.ElementTree as ET
+
+
 import json
-import logging
 from pydub import AudioSegment
-import math
+from dotenv import load_dotenv
 import requests
-# from google.cloud import speech
-# from google.cloud.speech import types
-import io
+from langchain.chat_models import ChatAnthropic
+from langchain.prompts import ChatPromptTemplate
+
+# from langchain.document_loaders import JSONLoader
+from langchain.embeddings import OpenAIEmbeddings, CacheBackedEmbeddings
+from langchain.storage import LocalFileStore
+# from langchain.vectorstores import Chroma
+from langchain.vectorstores import FAISS
+from faiss_retrieve import load_vs, create_vs
+from faiss_update import update_vs_new_record, delete_by_id, save_vs, update_vs_existing_record
+
+
+load_dotenv()
 
 app = Flask(__name__)
-# socketio = SocketIO(app, async_mode='eventlet')
 
-# Heroku provides the DATABASE_URL environment variable for connecting to your database.
-DATABASE_URL = os.environ['DATABASE_URL']
-conn = psycopg2.connect(DATABASE_URL, sslmode='require')
 
-# When using SQLAlchemy with postgresql driver and psycopg2,
-# it requires the URL to start with "postgresql://" instead of "postgres://"
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
 
-db = SQLAlchemy(app)
-
-class User(db.Model):
-    id = db.Column(db.String, primary_key=True)
-    name = db.Column(db.String(50))
-    language = db.Column(db.String(20))
-
-class UserInteraction(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.String, db.ForeignKey('user.id'))
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
-    user_message = db.Column(db.Text)
-    bot_response = db.Column(db.Text)
-
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-# @socketio.on('audio')
-# def transcribe(audio_data):
-#     client = speech.SpeechClient()
-#     audio = types.RecognitionAudio(content=audio_data)
-#     config = types.RecognitionConfig(
-#         encoding=types.RecognitionConfig.AudioEncoding.LINEAR16,
-#         sample_rate_hertz=16000,
-#         language_code="en-US",
-#     )
-
-#     response = client.recognize(config=config, audio=audio)
-#     transcript = response.results[0].alternatives[0].transcript
-
-#     emit('transcript', transcript)
-
-TELEGRAM_TOKEN='6307288419:AAGb4zkECqwCwJjBV_bV9iW4krYZ4qTNS1E'
-
-TOKEN = TELEGRAM_TOKEN
-# TOKEN2 = os.environ.get('TELEGRAM_TOKEN2')
-PORT = int(os.environ.get('PORT', '8443'))
-# PORT2 = int(os.environ.get('PORT2', '8444'))
-
-# Replace 'YOUR_TELEGRAM_BOT_TOKEN' with your Telegram Bot's API token
-updater = Updater(token=TOKEN, use_context=True)
-
-# Replace 'YOUR_OPENAI_API_KEY' with your OpenAI API key
+TOKEN = os.environ.get('TELEGRAM_TOKEN')
+API_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+BASE_URL = f"https://api.telegram.org/bot{TOKEN}/"
 openai.api_key = os.environ.get('OPENAI_KEY')
+API_KEY = os.environ.get('API_KEY')
+SIM_THRESHOLD = 0.3
 
-# Replace 'YOUR_WEBHOOK_URL' with the actual webhook URL
-# WEBHOOK_POST_URL = "https://hook.eu1.make.com/t9wp8smpr6gm98y5pxjxf83ivvnppweq"
+@app.route('/webhook', methods=['POST'])
+def telegram_webhook():
+    update = request.get_json(force=True)
+    print(update)  # Print the received message to the terminal
 
-# Configure logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+    if 'callback_query' in update:
+        handle_callback_query(update['callback_query'])
+    elif 'message' in update:
+        message = update['message']
+        user_id = message['chat']['id']  # Extract the user's Telegram ID
+        if 'text' in message:
+            handle_text(message, user_id)
+        elif 'voice' in message:
+            handle_voice(message, user_id)
 
-def start(update: Update, context: CallbackContext) -> None:
-    with app.app_context():
-        user_id = update.message.from_user.id
-        name = update.message.from_user.first_name
-        language = update.message.from_user.language_code
+    return 'ok', 200
 
-        user = User(id=user_id, name=name, language=language)
-        db.session.add(user)
-        db.session.commit()
+def handle_callback_query(callback_query):
+    # Get the callback data
+    callback_data = callback_query['data']
+    # Send a message with the full story of the person
+    chat_id = callback_query['message']['chat']['id']
         
-    update.message.reply_text('Hello! I am in-car concierge. Type your message starting with @voxtex_bot or send me voice in any language. I work best with complex sentences.')
-    update.message.reply_text('Good example: Hey, let\'s go normal route to work, play Metallica and remind me to get groceries on the way back home. Jiz, it\'s so hot today, can you do something?')
-def log_updates(update: Update, context: CallbackContext) -> None:
-    logger.info(f"Incoming update: {update}")
-    # Return without further processing to avoid interfering with other functions
-    return  
+    # Check if the callback data starts with 'full_'
+    if callback_data.startswith('full_'):
+        send_message(chat_id, f"😎Here comes full aggregated story of the person! Imagine how cool is that!")
 
-def handle_text(update: Update, context: CallbackContext) -> None:
+
+def handle_text(message, user_id):
+    global search_mode
+    text = message['text']
+    chat_id = message['chat']['id']
+
+    if text == "/start":
+        # Send the basic rules of the app
+        rules = "*Welcome to DOSSIER CONNECTIONS CONCIERGE!*\n_Here how it works:_\n\n1. Send me a voice note describing a person you just met, for example: \"I've just met Sarah at hackathon, she is from Albania and works as data analyst\"\n2. To add information, simply say: \"I've met Sarah again, the one who is data analyst. She told me that she has a cute dog named \"Winnie\"\n3. To retrieve memory, describe the person you want me to give dossier on.\n\n*🦸‍♂️ Enjoy your augmented memory like super-human!*"
+        send_message(chat_id, rules)
+    elif text == "/search":
+        search_mode = True
+        send_message(chat_id, "Please send a voice message for search.")
+    else:
+        # Echo back the same text message
+        data = {
+            "chat_id": chat_id,
+            "text": "Please send a voice message with a new person description, or use /search function"
+        }
+        response = requests.post(BASE_URL + 'sendMessage', data=data)
+        print(response.status_code, response.text)
+
+def generate_label(note_text):
+    chat = ChatAnthropic(
+        anthropic_api_key=API_KEY)
+    template = ("You are a helpful personal assistant that helps to store informations about people I meet."
+                "Analyse the following text and extract key information about the person."
+                "Write the information in the structured format"
+                "If some informations are missing do not write them."
+                "For example:"
+                "<example>"
+                "Note: I met a guy called John, he lives here in London. He is a software engineer. "
+                "He is 30 years old. He is married and has 2 kids. He likes to play football. He is a fan of Arsenal. "
+                "Assistant:<name>John</name><age>30</age><city>London</city><job>software engineer</job><family>married, 2 kids</family><hobby>play football</hobby><interests>Arsenal</interests>"
+                "</example>"
+                "<example>"
+                "Note: I met a woman, I dont know her name, but she is 25 years old. She is a doctor. She lives in Berkley."
+                "Assistant:<age>25</age><city>Berkley</city><job>doctor</job>"
+                "</example>"
+                "<example>"
+                "Note: I met a person called Tim in an old town of Dubrownik. He seems to be old, but I really like him. He can talk about architecture for hours. "
+                "Assistant:<name>Tim</name><city>Dubrownik</city><hobby>architecture</hobby>"
+                "</example>"
+                "<example>"
+                "Note: I met Alice in a bar. She is a student at the local University"
+                "Assistant:<name>Alice</name><job>student</job><location>bar</location>"
+                "")
+    human_template = "Note: {text}"
+    chat_prompt = ChatPromptTemplate.from_messages([
+        ("system", template),
+        ("human", human_template),
+    ])
+    messages = chat_prompt.format_messages(text=note_text)
+    model_response_label = chat(messages)
+    print (model_response_label.content)
+
+    return {"label":model_response_label.content}
+
+def generate_story(note_text):
+    chat = ChatAnthropic(
+        anthropic_api_key=API_KEY)
+    template = ("You are a helpful personal assistant that helps to write a very short concise dossier about person based on the provided facts and notes. Please combine them into single coherent text. Don't make up new facts")
+    human_template = "Notes: {text}"
+    chat_prompt = ChatPromptTemplate.from_messages([
+        ("system", template),
+        ("human", human_template),
+    ])
+    messages = chat_prompt.format_messages(text=note_text)
+    model_response_label = chat(messages)
+    print (model_response_label.content)
+
+    return (model_response_label.content)
+
+search_mode = False
+
+def handle_voice(message, user_id):
+    global search_mode
     # Record the start time
     start_time = time.time()
-    print("Handling text message")
 
-    if '@voxtex_bot' in update.message.text:
-        # Process text message
-        print("Mention of VOXTEX detected")
-        
-        # Remove the bot's name from the message
-        message = update.message.text.replace('@maitee_bot', '')
-            
-        print(f"Incoming message: {message}")  # Print the incoming message
-            
-        # Prepare the prompt for OpenAI
-        prompt = "Act as an in-car voice assistant. Provide just output as numbered list. Only if the user request contains multiple intents, divide it into separate intents, rephrase each of them to imitate commands to the car or navigation or infotainment system, and present them as a numbered list. If there is only one intent, rephrase it as a single command. User request: " + message
-
-        # Use OpenAI's GPT-3 model to generate a response
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo-16k", 
-            # prompt=prompt,
-            messages=[
-                {
-                "role": "assistant",
-                "content": "Maitee"
-                },
-                {
-                "role": "user",
-                "content": prompt
-                },
-            ], 
-            max_tokens=500,
-            top_p=1, 
-            temperature=0.8, 
-            frequency_penalty=0.8,
-            presence_penalty=0 
-            # stop=["***"]
-        )
-        # Record the end time
-        end_time = time.time()
-
-        # Calculate the response time in milliseconds
-        response_time = (end_time - start_time)
-        # Process the response from OpenAI
-    
-        with app.app_context():
-            user_id = update.message.from_user.id
-            user_message = message
-            bot_response = f"{response['choices'][0]['message']['content'].strip()}"
-            interaction = UserInteraction(user_id=user_id, user_message=user_message, bot_response=bot_response)
-            db.session.add(interaction)
-            db.session.commit()
-
-        # Send the response back to the user
-        update.message.reply_text(f"{response['choices'][0]['message']['content'].strip()}\n\nTotal processing time: {response_time:.2f} seconds")
-
-        # bullet_points = response.choices[0].message.content.strip().split("\n")
-        # bullet_points_with_json = []
-
-        # for bullet_point in bullet_points:
-        #     bullet_point_text = bullet_point.strip()
-        #     bullet_point_json = {
-        #         "event_name": bullet_point_text,
-        #         "urgency": 5  # Set the urgency level based on your logic
-        #     }
-        #     bullet_points_with_json.append(bullet_point_json)
-
-        #     # Send the bullet points JSON to the webhook
-        #     headers = {
-        #         "Content-Type": "application/json"
-        #     }
-        #     data = {
-        #         "bullet_points": bullet_points_with_json
-        #     }
-        #     response = requests.post(WEBHOOK_POST_URL, headers=headers, json=data)
-            
-def handle_voice(update: Update, context: CallbackContext) -> None:
-    # Record the start time
-    start_time = time.time()
     # Process voice message
-    voice: Voice = update.message.voice
+    voice = message['voice']
     print("Handling voice message")
 
     # Download the voice message
-    voice_file = context.bot.get_file(voice.file_id)
-    voice_file.download('voice.ogg')
+    voice_file_id = voice['file_id']
+    voice_file_path = download_file(voice_file_id, 'voice.ogg')
 
     # Convert the voice message to WAV format with a sample rate of 16 kHz
-    # Convert the voice message to WAV format with a sample rate of 16 kHz
-    audio = AudioSegment.from_ogg('voice.ogg')
+    audio = AudioSegment.from_ogg(voice_file_path)
     audio = audio.set_frame_rate(16000)
     audio.export('voice.wav', format='wav')
     conversion_time = time.time() - start_time
@@ -207,7 +165,6 @@ def handle_voice(update: Update, context: CallbackContext) -> None:
         model="whisper-1",
         file=open('voice.wav', 'rb'),
     )
-    voice_time = time.time() - start_time - conversion_time
 
     print(response)
     response_str = json.dumps(response)
@@ -216,220 +173,316 @@ def handle_voice(update: Update, context: CallbackContext) -> None:
     # Process the transcription with GPT-3
     transcription = response_data['text']
 
-    # Log the transcription
-    # print(f"Transcription: {transcription}")
+    chat_id = message['chat']['id']
+    # text = f"{response['choices'][0]['message']['content'].strip()}\n\nTotal processing time: {response_time:.2f} seconds\nFile conversion: {conversion_time:.2f} sec\nASR: {voice_time:.2f} sec\nIntent processing: {openai_time:.2f} sec"
+    
+    if search_mode:
+        text = "Searching for: " + transcription
+        send_message(chat_id, text)
+        # Call your search function here
+        try:
+            vector_store = load_vs(user_id)
+        except FileNotFoundError:
+            print("Database file does not exist, creating a new one for new user")
+            vector_store = create_vs(user_id, transcription)
 
-    # Prepare the prompt for OpenAI
-    prompt = "Act as an in-car voice assistant. Provide just output as numbered list. Only if the user request contains multiple intents, divide it into separate intents, rephrase each of them to imitate commands to the car or navigation or infotainment system, and present them as a numbered list. If there is only one intent, rephrase it as a single command. User request: " + transcription
+        sim_search_results = vector_store.similarity_search_with_score(transcription, k=1)[0]
+        score = sim_search_results[1]
+        print(score)
+        label_result = generate_label(transcription)
+        print (label_result)
+        json_result = json.dumps(label_result)
+        if score < SIM_THRESHOLD:
+            print('Found relevant person:')
 
-    # Use OpenAI's GPT-3 model to generate a response
-    response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo-16k", 
-        # prompt=prompt,
-        messages=[
-            {
-            "role": "assistant",
-            "content": "Maitee"
-            },
-            {
-            "role": "user",
-            "content": prompt
-            },
-        ], 
-        max_tokens=300,
-        top_p=1, 
-        temperature=0.8, 
-        frequency_penalty=0.8,
-        presence_penalty=0 
-        # stop=["***"]
-    )
-    print(response['choices'][0]['message']['content'].strip())
-    # Record the end time
-    openai_time = time.time() - start_time - conversion_time - voice_time
-    end_time = time.time()
-    total_time = time.time() - start_time
+            note_text = sim_search_results[0].page_content
+            updated_labels = generate_label(note_text)
+            # Convert the label string to an XML element
+            root = ET.fromstring(f"<root>{updated_labels['label']}</root>")
 
-    # Calculate the response time in milliseconds
-    response_time = (end_time - start_time)
+            
 
-    # print(f"OpenAI response: {response['choices'][0]['message']['content'].strip()}")  # Print the response from OpenAI
-    with app.app_context():
-        user_id = update.message.from_user.id
-        user_message = transcription
-        bot_response = f"{response['choices'][0]['message']['content'].strip()}"
-        interaction = UserInteraction(user_id=user_id, user_message=user_message, bot_response=bot_response)
-        db.session.add(interaction)
-        db.session.commit()  
+            # Initialize an empty list to store the labels
+            labels = []
 
-    # Send the response back to the user
-    update.message.reply_text(f"{response['choices'][0]['message']['content'].strip()}\n\nTotal processing time: {response_time:.2f} seconds\nFile conversion: {conversion_time:.2f} sec\nASR: {voice_time:.2f} sec\nIntent processing: {openai_time:.2f} sec")
+            # Iterate over the child elements of the root element
+            for child in root:
+                # If the child element has child elements of its own (like the 'pets' element in your example),
+                # iterate over its child elements
+                if len(child):
+                    labels.append(f"*{child.tag.capitalize()}*")  # Add the category as a headline
+                    for grandchild in child:
+                        # If the grandchild element has child elements of its own (like the 'pet' elements in your example),
+                        # iterate over its child elements
+                        if len(grandchild):
+                            child_labels = []
+                            for great_grandchild in grandchild:
+                                # Add the great grandchild element's tag and text to the labels list
+                                if great_grandchild.text is not None:  # Check if the text is not None before calling strip()
+                                    child_labels.append(f"{great_grandchild.tag.capitalize()}: {great_grandchild.text.strip()}")
+                            labels.append(', '.join(child_labels))  # Add the child's details as a single line
+                        else:
+                            # If the grandchild element doesn't have child elements, add its tag and text to the labels list
+                            if grandchild.text is not None:  # Check if the text is not None before calling strip()
+                                labels.append(f"{grandchild.tag.capitalize()}: {grandchild.text.strip()}")
+                else:
+                    # If the child element doesn't have child elements, add its tag and text to the labels list
+                    if child.text is not None:  # Check if the text is not None before calling strip()
+                        labels.append(f"{child.tag.capitalize()}: {child.text.strip()}")
 
+            # Format the labels into a string
+            labels_str = '\n'.join(labels)
+            markdown_chars = '_'
+            for char in markdown_chars:
+                labels_str = labels_str.replace(char, '\\' + char)
 
-    # bullet_points = response.choices[0].message.content.strip().split("\n")
-    # bullet_points_with_json = []
+            # # Extract the labels from the result
+            # labels = label_result['label'].split('\n')
+            summary = generate_story(sim_search_results[0].page_content)
+            print(summary)
+            # # Format the labels into a string
+            # labels_str = ', '.join([f"{label.strip().split('<')[1].split('>')[0].capitalize()}: {label.strip().split('</')[0].split('>')[1]}" for label in labels if label.strip()])
 
-    # for bullet_point in bullet_points:
-    #     bullet_point_text = bullet_point.strip()
-    #     bullet_point_json = {
-    #         "event_name": bullet_point_text,
-    #         "urgency": 5  # Set the urgency level based on your logic
-    #     }
-    #     bullet_points_with_json.append(bullet_point_json)
+            send_message(chat_id,f"Found relevant person! Please see the datapoints:\n\n{labels_str}\n\n{summary}")
 
-    # # Send the bullet points JSON to the webhook
-    # headers = {
-    #     "Content-Type": "application/json"
-    # }
-    # data = {
-    #     "bullet_points": bullet_points_with_json
-    # }
-    # try:
-    #     response = requests.post(WEBHOOK_POST_URL, headers=headers, json=data)
-    #     response.raise_for_status()  # Raise an exception if the request fails (status code >= 400)
-    #     print("Webhook request successful")
-    # except requests.exceptions.RequestException as e:
-    #     print(f"Error sending webhook request: {e}")
-
-def split_audio(file_path, segment_duration):
-    audio = AudioSegment.from_file(file_path)
-    total_duration = len(audio)
-
-    segments = []
-    start_time = 0
-    end_time = segment_duration
-
-    while start_time < total_duration:
-        segment = audio[start_time:end_time]
-        segments.append(segment)
-        start_time = end_time
-        end_time += segment_duration
-
-    return segments
-
-def handle_musicfile(update: Update, context: CallbackContext) -> None:
-    # Record the start time
-    start_time = time.time()
-    # Process music file attachment
-    music_file: Document = update.message.audio
-    print("Handling audio message") 
-
-    # Check the file extension
-    file_extension = os.path.splitext(music_file.file_name)[1].lower()
-
-    if file_extension in ['.ogg', '.mp3', '.wav']:
-        # Download the music file
-        music_file_path = os.path.join('music_files', str(update.message.message_id) + file_extension)
-        music_file.get_file().download(music_file_path)
-
-        # Split the music file into segments
-        segment_duration = 30 * 1000  # Duration of each segment in milliseconds
-        audio_segments = split_audio(music_file_path, segment_duration)
-
-        # Transcribe each audio segment
-        transcriptions = []
-        for segment in audio_segments:
-            # Export the audio segment as a temporary file
-            segment_path = os.path.join('music_files', 'temp_segment.wav')
-            segment.export(segment_path, format='wav')
-
-            # Transcribe the audio segment with Whisper ASR API
-            response = openai.Audio.transcribe(
-                model="whisper-1",
-                file=open(segment_path, 'rb'),
-            )
-            transcription = response['text']
-            transcriptions.append(transcription)
-
-            # Remove the temporary segment file
-            os.remove(segment_path)
-
-        # Combine the transcriptions
-        combined_transcription = ' '.join(transcriptions)
-
-        # Send the transcript to the user
-        update.message.reply_text(f"{combined_transcription}")
-
-        # Prepare the prompt for OpenAI
-        prompt = "Summarise the text, propose a plan to action on the ideas described. Text: " + combined_transcription
-
-        # Use OpenAI's GPT-3 model to generate a response
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo-16k", 
-            # prompt=prompt,
-            messages=[
-                {
-                "role": "assistant",
-                "content": "Maitee"
-                },
-                {
-                "role": "user",
-                "content": prompt
-                },
-            ], 
-            max_tokens=10000,
-            top_p=1, 
-            temperature=0.8, 
-            frequency_penalty=0.8,
-            presence_penalty=0 
-            # stop=["***"]
-        )
-
-        # Record the end time
-        end_time = time.time()
-        total_time = end_time - start_time
-
-        print(f"OpenAI response: {response.choices[0].message.content.strip()}")
-
-        with app.app_context():
-            user_id = update.message.from_user.id
-            user_message = combined_transcription
-            bot_response = f"{response.choices[0].message.content.strip()}"
-            interaction = UserInteraction(user_id=user_id, user_message=user_message, bot_response=bot_response)
-            db.session.add(interaction)
-            db.session.commit()
-
-        # Send the response back to the user
-        update.message.reply_text(f"{response.choices[0].message.content.strip()}\n\nTotal processing time: {total_time:.2f} seconds")
-
+        # search_documents(text, chat_id)
+        print("Search activated")
+        search_mode = False
+        # send_message(chat_id, search_result)
     else:
-        update.message.reply_text("Unsupported audio file format. Please send an OGG, MP3, or WAV file.")
+        try:
+            vector_store = load_vs(user_id)
+        except FileNotFoundError:
+            print("Database file does not exist, creating a new one for new user")
+            vector_store = create_vs(user_id, transcription)
 
-def error_handler(update: Update, context: CallbackContext) -> None:
-    logger = logging.getLogger(__name__)
-    logger.warning(f"Unhandled update: {update}")
+        sim_search_results = vector_store.similarity_search_with_score(transcription, k=1)[0]
+        score = sim_search_results[1]
+        print(score)
+        print(sim_search_results[0])
+        label_result = generate_label(transcription)
+        print (label_result)
+        json_result = json.dumps(label_result)
+        if score < SIM_THRESHOLD:
+            print('Found existing record:')
+            # Convert the label string to an XML element
+            root = ET.fromstring(f"<root>{label_result['label']}</root>")
 
-def log_updates(update: Update, context: CallbackContext) -> None:
-    logger.info(f"Incoming update: {update}")
+            # Initialize an empty list to store the labels
+            labels = []
 
-def main() -> None:
-    with app.app_context():
-        # Create the database
-        db.create_all()
-    
-    # Create directories for storing audio and music files
-    os.makedirs('audio_files', exist_ok=True)
-    os.makedirs('music_files', exist_ok=True)
+            # Iterate over the child elements of the root element
+            for child in root:
+                # If the child element has child elements of its own (like the 'pets' element in your example),
+                # iterate over its child elements
+                if len(child):
+                    labels.append(f"*{child.tag.capitalize()}*")  # Add the category as a headline
+                    for grandchild in child:
+                        # If the grandchild element has child elements of its own (like the 'pet' elements in your example),
+                        # iterate over its child elements
+                        if len(grandchild):
+                            child_labels = []
+                            for great_grandchild in grandchild:
+                                # Add the great grandchild element's tag and text to the labels list
+                                if great_grandchild.text is not None:  # Check if the text is not None before calling strip()
+                                    child_labels.append(f"{great_grandchild.tag.capitalize()}: {great_grandchild.text.strip()}")
+                            labels.append(', '.join(child_labels))  # Add the child's details as a single line
+                        else:
+                            # If the grandchild element doesn't have child elements, add its tag and text to the labels list
+                            if grandchild.text is not None:  # Check if the text is not None before calling strip()
+                                labels.append(f"{grandchild.tag.capitalize()}: {grandchild.text.strip()}")
+                else:
+                    # If the child element doesn't have child elements, add its tag and text to the labels list
+                    if child.text is not None:  # Check if the text is not None before calling strip()
+                        labels.append(f"{child.tag.capitalize()}: {child.text.strip()}")
 
-    dispatcher = updater.dispatcher
+            # Format the labels into a string
+            labels_str = '\n'.join(labels)
+            # # Extract the labels from the result
+            # labels = label_result['label'].split('\n')
+            profile_id = sim_search_results[0].metadata['id']
+            # # Format the labels into a string
+            # labels_str = ', '.join([f"{label.strip().split('<')[1].split('>')[0].capitalize()}: {label.strip().split('</')[0].split('>')[1]}" for label in labels if label.strip()])
 
-    
-    # taking care of start function
-    dispatcher.add_handler(CommandHandler("start", start))
-    dispatcher.add_handler(MessageHandler(Filters.audio, handle_musicfile))
-    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
-    dispatcher.add_handler(MessageHandler(Filters.voice, handle_voice))
-    dispatcher.add_error_handler(error_handler)
+            send_message(chat_id,f"Found existing record! Updating with the following data:\n\n{labels_str}",profile_id)
+            vs = update_vs_existing_record(vector_store, transcription, sim_search_results[0])
+            print(vs)
+            print("Ahtung!")
+        else:
+            print('No similar records found\nUpdating database with new record')
+            # Wrap the label string in a single root element and convert it to an XML element
+            root = ET.fromstring(f"<root>{label_result['label']}</root>")
 
-     # Start the webhooks
-    updater.start_webhook(
-        listen="0.0.0.0",
-        port=int(PORT),
-        url_path=TOKEN,
-        webhook_url='https://dossier-05f21382d3b0.herokuapp.com/' + TOKEN
+            # Initialize an empty list to store the labels
+            labels = []
+
+            # Iterate over the child elements of the root element
+            for child in root:
+                # If the child element has child elements of its own (like the 'pets' element in your example),
+                # iterate over its child elements
+                if len(child):
+                    labels.append(f"*{child.tag.capitalize()}*")  # Add the category as a headline
+                    for grandchild in child:
+                        # If the grandchild element has child elements of its own (like the 'pet' elements in your example),
+                        # iterate over its child elements
+                        if len(grandchild):
+                            child_labels = []
+                            for great_grandchild in grandchild:
+                                # Add the great grandchild element's tag and text to the labels list
+                                child_labels.append(f"{great_grandchild.tag.capitalize()}: {great_grandchild.text.strip()}")
+                            labels.append(', '.join(child_labels))  # Add the child's details as a single line
+                        else:
+                            # If the grandchild element doesn't have child elements, add its tag and text to the labels list
+                            labels.append(f"{grandchild.tag.capitalize()}: {grandchild.text.strip()}")
+                else:
+                    # If the child element doesn't have child elements, add its tag and text to the labels list
+                    labels.append(f"{child.tag.capitalize()}: {child.text.strip()}")
+
+            # Format the labels into a string
+            labels_str = '\n'.join(labels)
+            # Send the message to the user
+            send_message(chat_id, f"🙅‍♀️ No similar person found.\n\nUpdating your knowledge base with new record:\n\n{labels_str}")
+            vs = update_vs_new_record(vector_store, transcription)
+        save_vs(vs, user_id)
+        print("FAISS updated")
+
+    # text = transcription
+    # send_message(chat_id, text)
+    # if search_mode:
+    #     # Call your search function here
+    #     search_documents(text, chat_id)
+    #     print("Search activated")
+    #     search_mode = False
+    #     # send_message(chat_id, search_result)
+    # else:
+    #     label_result = generate_label(text)
+    #     print (label_result)
+    #     label_text = "Great! I have saved new person in your contact book."
+    #     send_message(chat_id, label_text)
+    #     send_message(chat_id, label_result["label"])
+    #     json_result = json.dumps(label_result)
+    #     process_documents(json_result)
+
+
+def download_file(file_id, filename):
+    response = requests.get(BASE_URL + 'getFile', params={'file_id': file_id})
+    file_info = response.json()
+
+    if 'result' in file_info:
+        file_path = file_info['result']['file_path']
+        file_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
+        response = requests.get(file_url)
+        with open(filename, 'wb') as f:
+            f.write(response.content)
+        return filename
+    else:
+        print(f"Error getting file: {file_info}")
+        return None
+
+def send_message(chat_id, text, profile_id=None):
+    data = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
+
+    # If a profile ID is provided, add an inline button
+    if profile_id is not None:
+        keyboard = [[
+            {
+                "text": "Show full story of this person",
+                "callback_data": f"full_{profile_id}"
+            }
+        ]]
+        data["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
+
+    response = requests.post(BASE_URL + 'sendMessage', data=data)
+    print(response.status_code, response.text)
+
+class MyDocument:
+    def __init__(self, page_content, metadata={}):
+        self.page_content = page_content
+        self.metadata = metadata
+
+def process_documents(documents):
+    # Use the provided documents
+    documents = json.loads(documents)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    fs = LocalFileStore(os.path.join(base_dir, 'static', 'cache'))
+
+    # Convert the JSON object to a list of MyDocument objects
+    docs = [MyDocument(json.dumps(document), metadata={'id': str(uuid.uuid4())}) for document in documents]
+
+    underlying_embeddings = OpenAIEmbeddings()
+
+    embedder = CacheBackedEmbeddings.from_bytes_store(
+        underlying_embeddings, fs, namespace=underlying_embeddings.model
     )
 
-    updater.idle()
+   
 
+    input_file_name_without_ext = "processed_docs"
+    faiss_file_path = os.path.join(base_dir, 'static', 'faiss', f'{input_file_name_without_ext}.faiss')
+    
+    # Check if the FAISS index file exists
+    if os.path.exists(faiss_file_path):
+        # If it exists, load it
+        vectorstore = FAISS.load_local(faiss_file_path, embedder)
+    else:
+        # If it doesn't exist, create a new FAISS index
+         # Create the Chroma vector store
+        vectorstore = FAISS.from_documents(documents=docs, embedding=embedder)
+        list(fs.yield_keys())[:5]
+
+    # Add new vectors to the existing index
+    for doc in vectorstore.documents:
+        vectorstore.add_document(doc)
+
+    # Save the updated Faiss index
+    vectorstore.save_local(faiss_file_path)
+    print ("FAISS updated")
+
+def search_documents(search, chat_id):
+
+    # Use the provided documents
+    # documents = json.loads(documents)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    fs = LocalFileStore(os.path.join(base_dir, 'static', 'cache'))
+
+    # Convert the JSON object to a list of MyDocument objects
+    # docs = [MyDocument(json.dumps(documents))]
+
+    underlying_embeddings = OpenAIEmbeddings()
+
+    embedder = CacheBackedEmbeddings.from_bytes_store(
+        underlying_embeddings, fs, namespace=underlying_embeddings.model
+    )
+
+    input_file_name_without_ext = "processed_docs"
+    faiss_file_path = os.path.join(base_dir, 'static', 'faiss', f'{input_file_name_without_ext}.faiss')
+    
+    existing_vectorstore = FAISS.load_local(faiss_file_path, embedder)
+    query = search
+    k = 4  # Number of documents to return
+    results = existing_vectorstore.similarity_search_with_score(query, k)
+    print (results)
+
+    # Filter the results based on the score
+    filtered_results = [(doc, score) for doc, score in results if score < 0.2]
+
+    if filtered_results:
+        # Format the results into a string
+        results_str = "\n\n".join([f"Person {i+1}: {doc.page_content}" for i, (doc, score) in enumerate(filtered_results)])
+    else:
+        results_str = "No matches found. Please try again and provide a more detailed description."
+
+    # Send the results to the user
+    send_message(chat_id, results_str)
+
+    # for doc, score in results:
+    #     print(f"Document: {doc.page_content}, Score: {score}")
+    # print ("FAISS searched")
+
+    
 if __name__ == '__main__':
-    main()
-    # socketio.run(app, debug=True)
+    app.run(port=5000)
