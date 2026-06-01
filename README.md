@@ -18,7 +18,7 @@ pgvector** as the per-user memory store.
    compared against people you already know via pgvector.
 4. **Remember** — If it's someone you already know (cosine similarity above
    `SIM_THRESHOLD`), the new facts are **merged** into their record. Otherwise a
-   **new** person is created. Claude extracts the structured fields.
+   **new** person is created. GPT extracts the structured fields.
 5. **Recall** — Send `/search`, then describe a person; Dossier finds the
    closest match and writes a short dossier.
 
@@ -36,7 +36,7 @@ pgvector** as the per-user memory store.
 Telegram ──webhook──▶ Edge Function (Deno/TS)
                           ├─▶ OpenAI Whisper        (transcribe)
                           ├─▶ OpenAI Embeddings     (text-embedding-3-small)
-                          ├─▶ Anthropic Messages    (labels + dossier)
+                          ├─▶ OpenAI Chat           (labels + dossier, gpt-4o-mini)
                           └─▶ Postgres + pgvector   (per-user memory)
 ```
 
@@ -50,8 +50,7 @@ their chat id and protected by Row Level Security.
 | `supabase/migrations/0001_init.sql` | Schema: `users`, `people`, the `match_person` search function, RLS |
 | `supabase/functions/telegram-webhook/index.ts` | Webhook entry point and routing |
 | `supabase/functions/_shared/telegram.ts` | Telegram Bot API (send, download, secret check) |
-| `supabase/functions/_shared/openai.ts` | Whisper transcription + embeddings |
-| `supabase/functions/_shared/anthropic.ts` | Label extraction + dossier summaries |
+| `supabase/functions/_shared/openai.ts` | Whisper, embeddings, label extraction, dossier summaries |
 | `supabase/functions/_shared/labels.ts` | Format labels as Telegram Markdown |
 | `supabase/functions/_shared/db.ts` | Supabase data access (match / insert / update) |
 
@@ -62,7 +61,7 @@ their chat id and protected by Row Level Security.
 - [Supabase CLI](https://supabase.com/docs/guides/cli)
 - A Supabase project
 - A Telegram bot token ([@BotFather](https://t.me/BotFather))
-- OpenAI and Anthropic API keys
+- An OpenAI API key
 
 ### 1. Link and apply the schema
 

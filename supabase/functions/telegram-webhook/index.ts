@@ -12,8 +12,7 @@ import {
   sendMessage,
   verifyTelegramSecret,
 } from "../_shared/telegram.ts";
-import { embed, transcribe } from "../_shared/openai.ts";
-import { generateLabels, generateStory } from "../_shared/anthropic.ts";
+import { embed, generateLabels, generateStory, transcribe } from "../_shared/openai.ts";
 import { formatLabels, personName } from "../_shared/labels.ts";
 import {
   ensureUser,
