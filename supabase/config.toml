@@ -1,0 +1,8 @@
+# Partial Supabase config. The CLI fills in defaults for everything omitted.
+# Run `supabase link --project-ref <ref>` to bind this to your project.
+
+# Telegram calls the webhook without a Supabase JWT, so disable JWT verification
+# for this function. Requests are instead authenticated via the secret token
+# header (TELEGRAM_WEBHOOK_SECRET), checked in code.
+[functions.telegram-webhook]
+verify_jwt = false

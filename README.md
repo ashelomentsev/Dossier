@@ -1,99 +1,123 @@
 # Dossier — Connections Concierge
 
 An AI-augmented memory for the people you meet. Send the Telegram bot a voice
-note describing someone you just met, and Dossier transcribes it, extracts
-structured facts, and stores them in a personal, searchable knowledge base.
-Later, describe a person and Dossier returns a short dossier on them.
+note about someone, and Dossier transcribes it, extracts structured facts, and
+remembers them. Later, describe a person and Dossier hands you back a dossier.
 
 > *"Enjoy your augmented memory like a super-human."*
+
+Built on **Supabase Edge Functions** (Deno/TypeScript) with **Postgres +
+pgvector** as the per-user memory store.
 
 ## How it works
 
 1. **Capture** — You send a voice note ("I met Sarah at a hackathon, she's a
    data analyst from Albania").
-2. **Transcribe** — The audio is converted to WAV and transcribed with OpenAI
-   Whisper.
-3. **Extract** — Claude extracts structured fields (`name`, `age`, `city`,
-   `job`, `family`, `hobby`, `interests`, …) from the transcription.
-4. **Store / update** — The note is embedded and saved in a per-user
-   [FAISS](https://github.com/facebookresearch/faiss) vector store. If a note
-   is similar enough to an existing person (cosine distance below
-   `SIM_THRESHOLD`), that person's record is updated instead of creating a new
-   one.
-5. **Search** — Use `/search`, then send a voice note describing someone. The
-   bot retrieves the closest match and generates a concise summary.
+2. **Transcribe** — The OGG voice note goes straight to OpenAI Whisper.
+3. **Match** — The transcript is embedded (`text-embedding-3-small`) and
+   compared against people you already know via pgvector.
+4. **Remember** — If it's someone you already know (cosine similarity above
+   `SIM_THRESHOLD`), the new facts are **merged** into their record. Otherwise a
+   **new** person is created. Claude extracts the structured fields.
+5. **Recall** — Send `/search`, then describe a person; Dossier finds the
+   closest match and writes a short dossier.
 
 ### Telegram commands
 
-| Command   | Description                                            |
-| --------- | ------------------------------------------------------ |
-| `/start`  | Show the welcome message and usage instructions.       |
-| `/search` | Enter search mode; the next voice note is a query.     |
-| *(voice)* | Add a new person or update an existing one.            |
+| Command   | Description                                         |
+| --------- | --------------------------------------------------- |
+| `/start`  | Show the welcome message.                           |
+| `/search` | Next voice note is treated as a recall query.       |
+| *(voice)* | Add a new person or update an existing one.         |
 
 ## Architecture
 
-| File                 | Responsibility                                             |
-| -------------------- | --------------------------------------------------------- |
-| `app.py`             | Flask app, Telegram webhook, voice handling, label/story generation |
-| `faiss_retrieve.py`  | Load / create a per-user FAISS vector store               |
-| `faiss_update.py`    | Add, update, and delete records in a store                |
-| `gen_label.py`       | Standalone structured-label extraction with Claude        |
-| `process_new_note.py`| Experimental dedup using SentenceTransformers             |
-| `faq_retrieve.py`    | Separate `/faq` endpoint for community Q&A over chat archives |
-| `faq-vectorstore.py` | One-off script to build a FAISS index from a JSON export  |
+```
+Telegram ──webhook──▶ Edge Function (Deno/TS)
+                          ├─▶ OpenAI Whisper        (transcribe)
+                          ├─▶ OpenAI Embeddings     (text-embedding-3-small)
+                          ├─▶ Anthropic Messages    (labels + dossier)
+                          └─▶ Postgres + pgvector   (per-user memory)
+```
 
-Per-user data and embeddings are written under `static/faiss/` and
-`static/cache/` (both git-ignored).
+Everything is **multi-tenant**: each Telegram user gets isolated data, keyed by
+their chat id and protected by Row Level Security.
+
+### Layout
+
+| Path | Responsibility |
+| ---- | -------------- |
+| `supabase/migrations/0001_init.sql` | Schema: `users`, `people`, the `match_person` search function, RLS |
+| `supabase/functions/telegram-webhook/index.ts` | Webhook entry point and routing |
+| `supabase/functions/_shared/telegram.ts` | Telegram Bot API (send, download, secret check) |
+| `supabase/functions/_shared/openai.ts` | Whisper transcription + embeddings |
+| `supabase/functions/_shared/anthropic.ts` | Label extraction + dossier summaries |
+| `supabase/functions/_shared/labels.ts` | Format labels as Telegram Markdown |
+| `supabase/functions/_shared/db.ts` | Supabase data access (match / insert / update) |
 
 ## Setup
 
 ### Prerequisites
 
-- Python 3.10+
-- [`ffmpeg`](https://ffmpeg.org/) (required by `pydub` for audio conversion)
+- [Supabase CLI](https://supabase.com/docs/guides/cli)
+- A Supabase project
 - A Telegram bot token ([@BotFather](https://t.me/BotFather))
 - OpenAI and Anthropic API keys
 
-### Install
+### 1. Link and apply the schema
 
 ```bash
-python -m venv myenv
-source myenv/bin/activate        # Windows: myenv\Scripts\activate
-pip install -r requirements.txt
+supabase link --project-ref <your-project-ref>
+supabase db push
 ```
 
-### Configure
-
-Create a `.env` file in the project root (it is git-ignored):
-
-```dotenv
-TELEGRAM_TOKEN=your-telegram-bot-token
-OPENAI_KEY=your-openai-api-key
-API_KEY=your-anthropic-api-key
-WEBHOOK_URL=https://your-public-host/webhook
-```
-
-### Run
+### 2. Configure secrets
 
 ```bash
-python app.py          # serves on http://localhost:5000
+cp .env.example .env   # fill in the values
+supabase secrets set --env-file ./.env
 ```
 
-The Telegram Bot API requires a public HTTPS URL for webhooks. For local
-development, expose port 5000 with a tunnel (e.g. `ngrok http 5000`), then
-register the webhook:
+`SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are injected automatically — you
+don't set those.
+
+### 3. Deploy
 
 ```bash
-curl -F "url=https://<your-public-url>/webhook" \
-  "https://api.telegram.org/bot<TELEGRAM_TOKEN>/setWebhook"
+supabase functions deploy telegram-webhook   # verify_jwt is off via config.toml
 ```
 
-## Security note
+### 4. Register the webhook
 
-Never commit API keys. All keys are read from environment variables. If a key
-is ever exposed in source or git history, **revoke and rotate it** — removing
-it from the latest commit is not enough, as it remains in history.
+```bash
+curl "https://api.telegram.org/bot<TELEGRAM_TOKEN>/setWebhook" \
+  -d "url=https://<project-ref>.supabase.co/functions/v1/telegram-webhook" \
+  -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
+```
+
+### Local development
+
+```bash
+deno task serve   # runs the function locally with ./.env
+```
+
+## Roadmap
+
+- **Phase 1 (this code)** — Multi-tenant bot; Supabase is the source of truth.
+- **Phase 2 — Obsidian** — Connect your own GitHub-backed Obsidian vault. Your
+  Markdown vault becomes canonical (one note per person, frontmatter labels,
+  wikilink graph) and Supabase/pgvector becomes a rebuildable search index. The
+  schema already carries the `storage_mode` / `vault_repo` / `gh_installation_id`
+  fields for this.
+
+## Security & privacy notes
+
+- **No secrets in source.** All keys come from environment/Supabase secrets.
+  Rotate any key that ever lands in git history.
+- **The webhook is authenticated** via Telegram's secret-token header.
+- **You're storing personal data about third parties.** Plan for export and
+  deletion paths before running this for real users; per-user data is isolated
+  via RLS from the start.
 
 ## License
 

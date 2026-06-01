@@ -1,30 +1,25 @@
-# Environments
-myenv/
-venv/
-env/
-.venv/
-
 # Secrets
 .env
 .env.*
+!.env.example
 *.key
 
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.egg-info/
-.pytest_cache/
-.mypy_cache/
+# Supabase CLI
+.branches/
+.temp/
 
-# FAISS stores & cached embeddings (per-user data)
-static/faiss/
-static/cache/
-static/json/
+# Deno
+deno.lock
 
 # Audio / test artifacts
 *.ogg
 *.wav
+
+# Legacy Python virtualenv (pre-rewrite)
+myenv/
+venv/
+.venv/
+__pycache__/
 
 # OS / editor
 .DS_Store
