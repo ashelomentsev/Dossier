@@ -1,0 +1,32 @@
+# Environments
+myenv/
+venv/
+env/
+.venv/
+
+# Secrets
+.env
+.env.*
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# FAISS stores & cached embeddings (per-user data)
+static/faiss/
+static/cache/
+static/json/
+
+# Audio / test artifacts
+*.ogg
+*.wav
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

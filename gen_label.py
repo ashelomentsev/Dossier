@@ -1,7 +1,9 @@
+import os
+
 from langchain.chat_models import ChatAnthropic
 from langchain.prompts import ChatPromptTemplate
 
-API_KEY = "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"
+API_KEY = os.environ.get('API_KEY')
 
 def generate_label(note_text):
     chat = ChatAnthropic(
