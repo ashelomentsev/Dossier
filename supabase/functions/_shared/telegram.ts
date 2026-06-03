@@ -40,7 +40,8 @@ export async function sendMessage(
     parse_mode: "Markdown",
   };
   if (opts.buttons?.length) {
-    body.reply_markup = { inline_keyboard: [opts.buttons] };
+    // One button per row — reads cleanly for a vertical shortlist, identical for one button.
+    body.reply_markup = { inline_keyboard: opts.buttons.map((b) => [b]) };
   } else if (opts.forceReply) {
     body.reply_markup = {
       force_reply: true,

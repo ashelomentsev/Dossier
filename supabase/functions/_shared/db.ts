@@ -120,22 +120,22 @@ export async function matchPerson(
  */
 export const RECALL_THRESHOLD = 0.2;
 
-/** Find the closest person to a recall query (nearest-first, low floor). */
-export async function searchPerson(
+/** Find the closest people to a recall query (nearest-first, low floor). */
+export async function searchPeople(
   userId: number,
   embedding: number[],
   name?: string | null,
-): Promise<Person | null> {
+  limit = 3,
+): Promise<Person[]> {
   const { data, error } = await supabase.rpc("match_person", {
     query_embedding: embedding,
     match_user_id: userId,
     match_threshold: RECALL_THRESHOLD,
-    match_count: 1,
+    match_count: limit,
     match_name: name ?? null,
   });
   if (error) throw error;
-  const candidates = (data ?? []) as Person[];
-  return candidates[0] ?? null; // RPC orders nearest-first
+  return (data ?? []) as Person[]; // RPC orders nearest-first
 }
 
 interface PersonInput {

@@ -27,11 +27,16 @@ import {
   getPerson,
   insertPerson,
   matchPerson,
-  searchPerson,
+  searchPeople,
   setSearchMode,
   updatePerson,
 } from "../_shared/db.ts";
-import { TelegramCallbackQuery, TelegramMessage, TelegramUpdate } from "../_shared/types.ts";
+import {
+  Person,
+  TelegramCallbackQuery,
+  TelegramMessage,
+  TelegramUpdate,
+} from "../_shared/types.ts";
 
 const WELCOME = `*Welcome to DOSSIER — your Connections Concierge!*
 _Here's how it works:_
@@ -58,13 +63,35 @@ function replyHint(personId: string): string {
   return `\n\n[Record ID](${RECORD_LINK_BASE}${personId})`;
 }
 
-// callback_data prefix for the "add changes" button. `edit:<uuid>` is ~41 bytes,
-// well under Telegram's 64-byte callback_data limit.
+// callback_data prefixes. `<prefix><uuid>` is ~41 bytes, well under Telegram's
+// 64-byte callback_data limit. EDIT starts a correction; SHOW opens a dossier
+// from the recall shortlist.
 const EDIT_PREFIX = "edit:";
+const SHOW_PREFIX = "show:";
 
 /** The inline button shown on every confirmation to start a correction. */
 function editButton(personId: string) {
   return [{ text: "✍️ Add changes", callback_data: `${EDIT_PREFIX}${personId}` }];
+}
+
+/** Short, disambiguating label for a shortlist button: "Tilly · Revolut, London". */
+function personButtonLabel(p: Person): string {
+  const name = p.name ?? personName(p.labels) ?? "Unknown";
+  const hints: string[] = [];
+  for (const k of ["job", "city", "where_met", "location"]) {
+    const v = p.labels?.[k];
+    if (v) hints.push(Array.isArray(v) ? String(v[0]) : String(v));
+    if (hints.length >= 2) break;
+  }
+  const label = hints.length ? `${name} · ${hints.join(", ")}` : name;
+  return label.length > 60 ? `${label.slice(0, 57)}…` : label;
+}
+
+/** Render a person's dossier (labels + a short generated summary). */
+async function sendDossier(chatId: number, person: Person): Promise<void> {
+  const story = await generateStory(person.note);
+  const header = person.name ? `Here's what I have on *${person.name}*:` : "Found a match:";
+  await sendMessage(chatId, `${header}\n\n${formatLabels(person.labels)}\n\n${story}`.trim());
 }
 
 /** Recover the record id from a replied-to confirmation (link entity, or text). */
@@ -134,20 +161,25 @@ async function handleVoice(message: TelegramMessage): Promise<void> {
   const isRecallQuestion = looksLikeRecall(transcription);
   const wantRecall = user.search_mode || isRecallQuestion;
 
-  // Recall mode: return a dossier on the closest person, never write. Uses a
-  // permissive floor (searchPerson) rather than the strict capture threshold —
-  // a short query rarely reaches 0.7 against a full note, so reusing the capture
-  // match here would find no one even when a clear match exists.
+  // Recall mode: never write. Uses a permissive floor (searchPeople) rather than
+  // the strict capture threshold — a short query rarely reaches 0.7 against a full
+  // note, so reusing the capture match would find no one. Returns up to 3 so the
+  // user can disambiguate when several people are close.
   if (wantRecall) {
     if (user.search_mode) await setSearchMode(chatId, false);
-    const match = await searchPerson(chatId, embedding, name);
-    console.log("branch: search", { chatId, queryName: name, matchId: match?.id ?? null });
-    if (match) {
-      const story = await generateStory(match.note);
-      const header = match.name ? `Here's what I have on *${match.name}*:` : "Found a match:";
-      await sendMessage(chatId, `${header}\n\n${formatLabels(match.labels)}\n\n${story}`.trim());
-    } else {
+    const matches = await searchPeople(chatId, embedding, name, 3);
+    console.log("branch: search", { chatId, queryName: name, found: matches.length });
+    if (matches.length === 0) {
       await sendMessage(chatId, "🤷 No one in your memory matches that description yet.");
+    } else if (matches.length === 1) {
+      await sendDossier(chatId, matches[0]);
+    } else {
+      // Ambiguous — let the user pick the one they meant from a tappable shortlist.
+      const buttons = matches.map((p) => ({
+        text: personButtonLabel(p),
+        callback_data: `${SHOW_PREFIX}${p.id}`,
+      }));
+      await sendMessage(chatId, "🔎 I found a few people — which one did you mean?", { buttons });
     }
     return;
   }
@@ -247,19 +279,42 @@ async function handleCorrection(message: TelegramMessage, personId: string): Pro
   );
 }
 
+/** Route a tapped inline button to the right action by its callback_data prefix. */
+async function handleCallbackQuery(cb: TelegramCallbackQuery): Promise<void> {
+  await answerCallbackQuery(cb.id); // stop the button spinner regardless
+  const chatId = cb.message?.chat.id;
+  const data = cb.data ?? "";
+  if (!chatId) return;
+
+  if (data.startsWith(EDIT_PREFIX)) {
+    await startCorrection(cb, chatId, data.slice(EDIT_PREFIX.length));
+  } else if (data.startsWith(SHOW_PREFIX)) {
+    await showDossier(chatId, data.slice(SHOW_PREFIX.length));
+  }
+}
+
+/** Recall-shortlist pick: open the chosen person's dossier. */
+async function showDossier(chatId: number, personId: string): Promise<void> {
+  const person = await getPerson(personId, chatId);
+  if (!person) {
+    await sendMessage(chatId, "I couldn't find that record.");
+    return;
+  }
+  console.log("branch: show-dossier", { chatId, personId });
+  await sendDossier(chatId, person);
+}
+
 /**
  * "Add changes" button tap. An inline button can't open a reply box itself, so
  * we swap the confirmation for a force-reply prompt: delete the original and
  * re-post the record (carrying its id) with force_reply. The user's reply then
  * flows through the normal reply path (handleCorrection).
  */
-async function handleCallbackQuery(cb: TelegramCallbackQuery): Promise<void> {
-  await answerCallbackQuery(cb.id); // stop the button spinner regardless
-  const chatId = cb.message?.chat.id;
-  const data = cb.data ?? "";
-  if (!chatId || !data.startsWith(EDIT_PREFIX)) return;
-
-  const personId = data.slice(EDIT_PREFIX.length);
+async function startCorrection(
+  cb: TelegramCallbackQuery,
+  chatId: number,
+  personId: string,
+): Promise<void> {
   const person = await getPerson(personId, chatId);
   if (!person) {
     await sendMessage(chatId, "I couldn't find that record to edit.");
