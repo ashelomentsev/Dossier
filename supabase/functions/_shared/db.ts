@@ -113,6 +113,31 @@ export async function matchPerson(
   return chosen;
 }
 
+/**
+ * Permissive floor for recall. A short query ("a girl who sold Swiss watches")
+ * sits well below the 0.7 capture threshold against a full note, so search uses
+ * a low floor and returns the single nearest person above it.
+ */
+export const RECALL_THRESHOLD = 0.2;
+
+/** Find the closest person to a recall query (nearest-first, low floor). */
+export async function searchPerson(
+  userId: number,
+  embedding: number[],
+  name?: string | null,
+): Promise<Person | null> {
+  const { data, error } = await supabase.rpc("match_person", {
+    query_embedding: embedding,
+    match_user_id: userId,
+    match_threshold: RECALL_THRESHOLD,
+    match_count: 1,
+    match_name: name ?? null,
+  });
+  if (error) throw error;
+  const candidates = (data ?? []) as Person[];
+  return candidates[0] ?? null; // RPC orders nearest-first
+}
+
 interface PersonInput {
   name: string | null;
   note: string;

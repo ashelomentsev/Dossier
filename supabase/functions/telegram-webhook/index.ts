@@ -27,6 +27,7 @@ import {
   getPerson,
   insertPerson,
   matchPerson,
+  searchPerson,
   setSearchMode,
   updatePerson,
 } from "../_shared/db.ts";
@@ -128,37 +129,38 @@ async function handleVoice(message: TelegramMessage): Promise<void> {
   // recognizes the same person even when notes describe them differently).
   const labels = await generateLabels(transcription);
   const name = personName(labels);
-  const match = await matchPerson(chatId, embedding, name);
 
   // Recall if the user is in /search mode OR the note reads like a question.
   const isRecallQuestion = looksLikeRecall(transcription);
   const wantRecall = user.search_mode || isRecallQuestion;
-  console.log("matchResult", {
-    chatId,
-    queryName: name,
-    matched: !!match,
-    matchId: match?.id ?? null,
-    searchMode: user.search_mode,
-    isRecallQuestion,
-    wantRecall,
-  });
 
-  // Recall mode: return a dossier on the matched person, never write.
+  // Recall mode: return a dossier on the closest person, never write. Uses a
+  // permissive floor (searchPerson) rather than the strict capture threshold —
+  // a short query rarely reaches 0.7 against a full note, so reusing the capture
+  // match here would find no one even when a clear match exists.
   if (wantRecall) {
-    console.log("branch: search", { chatId });
     if (user.search_mode) await setSearchMode(chatId, false);
+    const match = await searchPerson(chatId, embedding, name);
+    console.log("branch: search", { chatId, queryName: name, matchId: match?.id ?? null });
     if (match) {
       const story = await generateStory(match.note);
       const header = match.name ? `Here's what I have on *${match.name}*:` : "Found a match:";
-      const labels = formatLabels(match.labels);
-      await sendMessage(chatId, `${header}\n\n${labels}\n\n${story}`.trim());
+      await sendMessage(chatId, `${header}\n\n${formatLabels(match.labels)}\n\n${story}`.trim());
     } else {
       await sendMessage(chatId, "🤷 No one in your memory matches that description yet.");
     }
     return;
   }
 
-  // Capture mode: update the matched person, or create a new one.
+  // Capture mode: update the matched person, or create a new one. Strict
+  // threshold (matchPerson) so a new note isn't merged into the wrong record.
+  const match = await matchPerson(chatId, embedding, name);
+  console.log("matchResult", {
+    chatId,
+    queryName: name,
+    matched: !!match,
+    matchId: match?.id ?? null,
+  });
   if (match) {
     console.log("branch: capture/update", { chatId, matchId: match.id });
     // Re-extract from the full merged note so labels reflect all accumulated facts.

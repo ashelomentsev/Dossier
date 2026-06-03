@@ -95,8 +95,12 @@ supabase functions deploy telegram-webhook   # verify_jwt is off via config.toml
 ```bash
 curl "https://api.telegram.org/bot<TELEGRAM_TOKEN>/setWebhook" \
   -d "url=https://<project-ref>.supabase.co/functions/v1/telegram-webhook" \
-  -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
+  -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>" \
+  --data-urlencode 'allowed_updates=["message","callback_query"]'
 ```
+
+`allowed_updates` **must** include `callback_query`, or Telegram won't deliver
+inline-button taps (the "Add changes" button) and they'll hang.
 
 ### Local development
 
