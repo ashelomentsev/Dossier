@@ -9,8 +9,23 @@ const supabase = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
 );
 
-/** Cosine-similarity cutoff for "is this someone I already know?" (was distance < 0.3). */
+/**
+ * Cosine-similarity cutoff for matching purely on content, when there's no name
+ * to lean on (or the nearest person has a different name).
+ */
 export const SIM_THRESHOLD = 0.7;
+
+/**
+ * Lower cutoff applied when the candidate shares the extracted name. A name is a
+ * strong hint, so we accept a weaker content match — but still require *some*
+ * overlap so a brand-new person who happens to share a name (another "Julia")
+ * isn't merged into the wrong record. This is the main knob: raise it to split
+ * more aggressively, lower it to merge more aggressively.
+ */
+export const NAME_SIM_THRESHOLD = 0.5;
+
+/** How many candidates to pull back for the app-side selection. */
+const MATCH_CANDIDATES = 5;
 
 /** Ensure a user row exists and return its current state. */
 export async function ensureUser(userId: number): Promise<UserState> {
@@ -31,19 +46,73 @@ export async function setSearchMode(userId: number, on: boolean): Promise<void> 
   if (error) throw error;
 }
 
-/** Nearest remembered person for this user, or null if none clears the threshold. */
+/**
+ * Decide which remembered person (if any) the new note refers to.
+ *
+ * Strategy:
+ *  - Pull the candidate pool: everyone sharing the extracted name, plus anyone
+ *    above SIM_THRESHOLD on content, nearest-first.
+ *  - If the name matches one or more people, content picks *which* one (the most
+ *    similar) and it merges only if that similarity clears NAME_SIM_THRESHOLD —
+ *    so a different person with the same name becomes a new record instead.
+ *  - With no name match, fall back to a pure content match above SIM_THRESHOLD.
+ */
 export async function matchPerson(
   userId: number,
   embedding: number[],
+  name?: string | null,
 ): Promise<Person | null> {
   const { data, error } = await supabase.rpc("match_person", {
     query_embedding: embedding,
     match_user_id: userId,
     match_threshold: SIM_THRESHOLD,
-    match_count: 1,
+    match_count: MATCH_CANDIDATES,
+    match_name: name ?? null,
   });
   if (error) throw error;
-  return data?.[0] ?? null;
+
+  const candidates = (data ?? []) as Person[];
+  const norm = (s?: string | null) => (s ?? "").trim().toLowerCase();
+  // Candidates are nearest-first, so the first same-name entry is also the most
+  // content-similar of the same-name people.
+  const nameMatches = name ? candidates.filter((c) => norm(c.name) === norm(name)) : [];
+
+  let chosen: Person | null = null;
+  let reason = "no-match";
+  if (nameMatches.length > 0) {
+    const best = nameMatches[0];
+    if ((best.similarity ?? 0) >= NAME_SIM_THRESHOLD) {
+      chosen = best;
+      reason = "name+content";
+    } else {
+      reason = "same-name-too-different"; // -> new distinct person
+    }
+  } else {
+    const nearest = candidates[0];
+    if (nearest && (nearest.similarity ?? 0) > SIM_THRESHOLD) {
+      chosen = nearest;
+      reason = name ? "content (no same-name)" : "content";
+    }
+  }
+
+  console.log("matchPerson", {
+    userId,
+    queryName: name ?? null,
+    candidates: candidates.length,
+    sameName: nameMatches.length,
+    bestSameName: nameMatches[0]
+      ? { name: nameMatches[0].name, sim: nameMatches[0].similarity }
+      : null,
+    nearest: candidates[0]
+      ? { name: candidates[0].name, sim: candidates[0].similarity }
+      : null,
+    nameThreshold: NAME_SIM_THRESHOLD,
+    simThreshold: SIM_THRESHOLD,
+    reason,
+    matchedId: chosen?.id ?? null,
+  });
+
+  return chosen;
 }
 
 interface PersonInput {
