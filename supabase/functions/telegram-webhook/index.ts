@@ -23,6 +23,7 @@ import {
 } from "../_shared/openai.ts";
 import { formatLabels, personName } from "../_shared/labels.ts";
 import {
+  deletePerson,
   ensureUser,
   getPerson,
   insertPerson,
@@ -63,15 +64,28 @@ function replyHint(personId: string): string {
   return `\n\n[Record ID](${RECORD_LINK_BASE}${personId})`;
 }
 
-// callback_data prefixes. `<prefix><uuid>` is ~41 bytes, well under Telegram's
-// 64-byte callback_data limit. EDIT starts a correction; SHOW opens a dossier
-// from the recall shortlist.
+// callback_data prefixes. `<prefix><uuid>` stays well under Telegram's 64-byte
+// callback_data limit. EDIT starts a correction; SHOW opens a dossier from the
+// recall shortlist; DEL asks to delete, DELYES/DELNO resolve that confirmation.
+// Prefixes are distinct strings (delyes:/delno: don't start with "del:"), so the
+// dispatcher's startsWith checks don't collide.
 const EDIT_PREFIX = "edit:";
 const SHOW_PREFIX = "show:";
+const DEL_PREFIX = "del:";
+const DELYES_PREFIX = "delyes:";
+const DELNO_PREFIX = "delno:";
 
 /** The inline button shown on every confirmation to start a correction. */
 function editButton(personId: string) {
   return [{ text: "✍️ Add changes", callback_data: `${EDIT_PREFIX}${personId}` }];
+}
+
+/** Buttons shown under a dossier: start a correction, or delete the record. */
+function dossierButtons(personId: string) {
+  return [
+    { text: "✍️ Add changes", callback_data: `${EDIT_PREFIX}${personId}` },
+    { text: "🗑 Delete", callback_data: `${DEL_PREFIX}${personId}` },
+  ];
 }
 
 /** Short, disambiguating label for a shortlist button: "Tilly · Revolut, London". */
@@ -87,11 +101,17 @@ function personButtonLabel(p: Person): string {
   return label.length > 60 ? `${label.slice(0, 57)}…` : label;
 }
 
-/** Render a person's dossier (labels + a short generated summary). */
+/**
+ * Render a person's dossier (labels + a short generated summary), with the hidden
+ * record-id link plus Add-changes / Delete buttons so the user can act on it.
+ */
 async function sendDossier(chatId: number, person: Person): Promise<void> {
   const story = await generateStory(person.note);
   const header = person.name ? `Here's what I have on *${person.name}*:` : "Found a match:";
-  await sendMessage(chatId, `${header}\n\n${formatLabels(person.labels)}\n\n${story}`.trim());
+  const body = `${header}\n\n${formatLabels(person.labels)}\n\n${story}`.trim();
+  await sendMessage(chatId, `${body}${replyHint(person.id)}`, {
+    buttons: dossierButtons(person.id),
+  });
 }
 
 /** Recover the record id from a replied-to confirmation (link entity, or text). */
@@ -290,7 +310,54 @@ async function handleCallbackQuery(cb: TelegramCallbackQuery): Promise<void> {
     await startCorrection(cb, chatId, data.slice(EDIT_PREFIX.length));
   } else if (data.startsWith(SHOW_PREFIX)) {
     await showDossier(chatId, data.slice(SHOW_PREFIX.length));
+  } else if (data.startsWith(DELYES_PREFIX)) {
+    await confirmDelete(cb, chatId, data.slice(DELYES_PREFIX.length));
+  } else if (data.startsWith(DELNO_PREFIX)) {
+    await cancelDelete(cb, chatId);
+  } else if (data.startsWith(DEL_PREFIX)) {
+    await askDelete(chatId, data.slice(DEL_PREFIX.length));
   }
+}
+
+/** Delete button: ask for confirmation first — deletion is irreversible. */
+async function askDelete(chatId: number, personId: string): Promise<void> {
+  const person = await getPerson(personId, chatId);
+  if (!person) {
+    await sendMessage(chatId, "I couldn't find that record.");
+    return;
+  }
+  await sendMessage(
+    chatId,
+    `🗑 Delete *${person.name ?? "this person"}*? This can't be undone.`,
+    {
+      buttons: [
+        { text: "✅ Yes, delete", callback_data: `${DELYES_PREFIX}${personId}` },
+        { text: "✖️ Cancel", callback_data: `${DELNO_PREFIX}${personId}` },
+      ],
+    },
+  );
+}
+
+/** Confirmed delete: remove the record and the confirmation prompt. */
+async function confirmDelete(
+  cb: TelegramCallbackQuery,
+  chatId: number,
+  personId: string,
+): Promise<void> {
+  const person = await getPerson(personId, chatId);
+  if (cb.message?.message_id) await deleteMessage(chatId, cb.message.message_id);
+  if (!person) {
+    await sendMessage(chatId, "That record is already gone.");
+    return;
+  }
+  await deletePerson(personId, chatId);
+  console.log("branch: delete", { chatId, personId });
+  await sendMessage(chatId, `🗑 Deleted *${person.name ?? "the record"}*.`);
+}
+
+/** Cancelled delete: just dismiss the confirmation prompt. */
+async function cancelDelete(cb: TelegramCallbackQuery, chatId: number): Promise<void> {
+  if (cb.message?.message_id) await deleteMessage(chatId, cb.message.message_id);
 }
 
 /** Recall-shortlist pick: open the chosen person's dossier. */

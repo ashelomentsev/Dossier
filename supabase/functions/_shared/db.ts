@@ -188,3 +188,13 @@ export async function updatePerson(
     .eq("user_id", userId);
   if (error) throw error;
 }
+
+/** Permanently delete a person. Scoped by user_id so one user can't delete another's. */
+export async function deletePerson(id: string, userId: number): Promise<void> {
+  const { error } = await supabase
+    .from("people")
+    .delete()
+    .eq("id", id)
+    .eq("user_id", userId);
+  if (error) throw error;
+}
