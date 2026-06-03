@@ -7,7 +7,13 @@
 // Processing is synchronous: we do the work, then ack Telegram. The chain is
 // mostly network I/O, so it stays within Edge Function limits.
 
-import { downloadVoice, sendMessage, verifyTelegramSecret } from "../_shared/telegram.ts";
+import {
+  answerCallbackQuery,
+  deleteMessage,
+  downloadVoice,
+  sendMessage,
+  verifyTelegramSecret,
+} from "../_shared/telegram.ts";
 import {
   applyCorrection,
   embed,
@@ -43,11 +49,21 @@ const RECORD_LINK_BASE = "https://dossier.app/p/";
 const RECORD_ID_RE = /\/p\/([0-9a-f-]{36})/i;
 
 /**
- * A hidden call-to-action: the user sees friendly link text, while the record id
- * rides invisibly in the URL so a Telegram reply addresses exactly this record.
+ * A neutral record-id tag rather than a call-to-action: the visible text is just
+ * "Record ID" (not meant to be clicked), while the id rides invisibly in the URL
+ * so a Telegram reply to this message addresses exactly this record.
  */
 function replyHint(personId: string): string {
-  return `\n\n[✍️ Reply here to add a LinkedIn/socials, phone, email, or a voice clarification](${RECORD_LINK_BASE}${personId})`;
+  return `\n\n[Record ID](${RECORD_LINK_BASE}${personId})`;
+}
+
+// callback_data prefix for the "add changes" button. `edit:<uuid>` is ~41 bytes,
+// well under Telegram's 64-byte callback_data limit.
+const EDIT_PREFIX = "edit:";
+
+/** The inline button shown on every confirmation to start a correction. */
+function editButton(personId: string) {
+  return [{ text: "✍️ Add changes", callback_data: `${EDIT_PREFIX}${personId}` }];
 }
 
 /** Recover the record id from a replied-to confirmation (link entity, or text). */
@@ -161,6 +177,7 @@ async function handleVoice(message: TelegramMessage): Promise<void> {
       `✍️ Updated ${mergedName ?? "an existing person"} with the new details:\n\n${
         formatLabels(mergedLabels)
       }${replyHint(match.id)}`,
+      { buttons: editButton(match.id) },
     );
   } else {
     console.log("branch: capture/insert", { chatId });
@@ -171,6 +188,7 @@ async function handleVoice(message: TelegramMessage): Promise<void> {
       `🙅 No similar person found — saving a new record:\n\n${formatLabels(labels)}${
         replyHint(newId)
       }`,
+      { buttons: editButton(newId) },
     );
   }
 }
@@ -223,13 +241,42 @@ async function handleCorrection(message: TelegramMessage, personId: string): Pro
     `✍️ Updated ${mergedName ?? "the record"}:\n\n${formatLabels(mergedLabels)}${
       replyHint(person.id)
     }`,
+    { buttons: editButton(person.id) },
   );
 }
 
+/**
+ * "Add changes" button tap. An inline button can't open a reply box itself, so
+ * we swap the confirmation for a force-reply prompt: delete the original and
+ * re-post the record (carrying its id) with force_reply. The user's reply then
+ * flows through the normal reply path (handleCorrection).
+ */
 async function handleCallbackQuery(cb: TelegramCallbackQuery): Promise<void> {
+  await answerCallbackQuery(cb.id); // stop the button spinner regardless
   const chatId = cb.message?.chat.id;
-  if (!chatId || !cb.data) return;
-  // Reserved for the "full story" button (Phase 2). No-op for now.
+  const data = cb.data ?? "";
+  if (!chatId || !data.startsWith(EDIT_PREFIX)) return;
+
+  const personId = data.slice(EDIT_PREFIX.length);
+  const person = await getPerson(personId, chatId);
+  if (!person) {
+    await sendMessage(chatId, "I couldn't find that record to edit.");
+    return;
+  }
+  console.log("branch: edit-button", { chatId, personId });
+
+  // Swap the confirmation (inline button) for a force-reply prompt; the two
+  // reply_markup kinds can't coexist on one message, hence delete + re-post.
+  if (cb.message?.message_id) {
+    await deleteMessage(chatId, cb.message.message_id);
+  }
+  await sendMessage(
+    chatId,
+    `✍️ Send your correction for *${person.name ?? "this person"}* — type it or record a ` +
+      `voice note (e.g. "her name is spelled Sara", or paste a LinkedIn URL):\n\n` +
+      `${formatLabels(person.labels)}${replyHint(person.id)}`,
+    { forceReply: true, placeholder: "Type or record your correction…" },
+  );
 }
 
 async function handleUpdate(update: TelegramUpdate): Promise<void> {

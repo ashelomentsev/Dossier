@@ -19,18 +19,33 @@ interface InlineButton {
   callback_data: string;
 }
 
+interface SendOptions {
+  // Inline keyboard buttons. Mutually exclusive with forceReply (Telegram allows
+  // only one reply_markup kind); buttons win if both are somehow set.
+  buttons?: InlineButton[];
+  // Open the user's reply box pre-targeted at this message.
+  forceReply?: boolean;
+  // Greyed-out hint shown in the empty input field when forceReply is set.
+  placeholder?: string;
+}
+
 export async function sendMessage(
   chatId: number,
   text: string,
-  buttons?: InlineButton[],
+  opts: SendOptions = {},
 ): Promise<void> {
   const body: Record<string, unknown> = {
     chat_id: chatId,
     text,
     parse_mode: "Markdown",
   };
-  if (buttons?.length) {
-    body.reply_markup = { inline_keyboard: [buttons] };
+  if (opts.buttons?.length) {
+    body.reply_markup = { inline_keyboard: [opts.buttons] };
+  } else if (opts.forceReply) {
+    body.reply_markup = {
+      force_reply: true,
+      input_field_placeholder: opts.placeholder,
+    };
   }
 
   const res = await fetch(`${BASE_URL}/sendMessage`, {
@@ -40,6 +55,30 @@ export async function sendMessage(
   });
   if (!res.ok) {
     console.error("sendMessage failed", res.status, await res.text());
+  }
+}
+
+/** Acknowledge a tapped inline button so its loading spinner stops. */
+export async function answerCallbackQuery(callbackQueryId: string): Promise<void> {
+  const res = await fetch(`${BASE_URL}/answerCallbackQuery`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ callback_query_id: callbackQueryId }),
+  });
+  if (!res.ok) {
+    console.error("answerCallbackQuery failed", res.status, await res.text());
+  }
+}
+
+/** Delete a message we sent (used to swap a confirmation for a force-reply prompt). */
+export async function deleteMessage(chatId: number, messageId: number): Promise<void> {
+  const res = await fetch(`${BASE_URL}/deleteMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
+  });
+  if (!res.ok) {
+    console.error("deleteMessage failed", res.status, await res.text());
   }
 }
 
