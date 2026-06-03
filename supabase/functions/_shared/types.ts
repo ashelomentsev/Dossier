@@ -11,11 +11,24 @@ export interface TelegramVoice {
   mime_type?: string;
 }
 
+// A formatting span on a message. We care about `text_link`, whose `url` we use
+// to smuggle a record id into our confirmations (recovered on reply).
+export interface TelegramMessageEntity {
+  type: string;
+  offset: number;
+  length: number;
+  url?: string;
+}
+
 export interface TelegramMessage {
   message_id: number;
   chat: TelegramChat;
   text?: string;
   voice?: TelegramVoice;
+  entities?: TelegramMessageEntity[];
+  // Present when the user replies to a message; carries the full original
+  // message (including its entities), which is how a reply round-trips a record id.
+  reply_to_message?: TelegramMessage;
 }
 
 export interface TelegramCallbackQuery {

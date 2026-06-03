@@ -7,12 +7,9 @@
 // Processing is synchronous: we do the work, then ack Telegram. The chain is
 // mostly network I/O, so it stays within Edge Function limits.
 
+import { downloadVoice, sendMessage, verifyTelegramSecret } from "../_shared/telegram.ts";
 import {
-  downloadVoice,
-  sendMessage,
-  verifyTelegramSecret,
-} from "../_shared/telegram.ts";
-import {
+  applyCorrection,
   embed,
   generateLabels,
   generateStory,
@@ -21,25 +18,50 @@ import {
 import { formatLabels, personName } from "../_shared/labels.ts";
 import {
   ensureUser,
+  getPerson,
   insertPerson,
   matchPerson,
   setSearchMode,
   updatePerson,
 } from "../_shared/db.ts";
-import {
-  TelegramCallbackQuery,
-  TelegramMessage,
-  TelegramUpdate,
-} from "../_shared/types.ts";
+import { TelegramCallbackQuery, TelegramMessage, TelegramUpdate } from "../_shared/types.ts";
 
 const WELCOME = `*Welcome to DOSSIER — your Connections Concierge!*
 _Here's how it works:_
 
 1. Send a voice note describing someone you met, e.g. "I just met Sarah at a hackathon, she's a data analyst from Albania."
 2. To add more, just say: "Met Sarah again — the data analyst. She has a cute dog named Winnie."
-3. Use /search, then describe a person to get their dossier.
+3. *Reply* to my confirmation to attach corrections — paste a LinkedIn/socials URL, phone, or email, or send a voice note with clarifications.
+4. Use /search, then describe a person to get their dossier.
 
 *🦸 Enjoy your augmented memory like a super-human!*`;
+
+// Carrier for record ids inside confirmation messages. The domain need not
+// resolve — it only exists so Telegram stores a `text_link` entity whose URL we
+// recover from `reply_to_message` when the user replies to correct the record.
+const RECORD_LINK_BASE = "https://dossier.app/p/";
+const RECORD_ID_RE = /\/p\/([0-9a-f-]{36})/i;
+
+/**
+ * A hidden call-to-action: the user sees friendly link text, while the record id
+ * rides invisibly in the URL so a Telegram reply addresses exactly this record.
+ */
+function replyHint(personId: string): string {
+  return `\n\n[✍️ Reply here to add a LinkedIn/socials, phone, email, or a voice clarification](${RECORD_LINK_BASE}${personId})`;
+}
+
+/** Recover the record id from a replied-to confirmation (link entity, or text). */
+function extractRecordId(msg?: TelegramMessage): string | null {
+  if (!msg) return null;
+  for (const e of msg.entities ?? []) {
+    if (e.type === "text_link" && e.url) {
+      const m = e.url.match(RECORD_ID_RE);
+      if (m) return m[1];
+    }
+  }
+  const m = (msg.text ?? "").match(RECORD_ID_RE);
+  return m ? m[1] : null;
+}
 
 /**
  * Heuristic recall detector. Runs on the English-normalized transcript, so it
@@ -128,7 +150,7 @@ async function handleVoice(message: TelegramMessage): Promise<void> {
     const mergedLabels = await generateLabels(mergedNote);
     const mergedName = personName(mergedLabels) ?? match.name;
     const mergedEmbedding = await embed(mergedNote);
-    await updatePerson(match.id, {
+    await updatePerson(match.id, chatId, {
       name: mergedName,
       note: mergedNote,
       labels: mergedLabels,
@@ -136,17 +158,72 @@ async function handleVoice(message: TelegramMessage): Promise<void> {
     });
     await sendMessage(
       chatId,
-      `✍️ Updated ${mergedName ?? "an existing person"} with the new details:\n\n${formatLabels(mergedLabels)}`,
+      `✍️ Updated ${mergedName ?? "an existing person"} with the new details:\n\n${
+        formatLabels(mergedLabels)
+      }${replyHint(match.id)}`,
     );
   } else {
     console.log("branch: capture/insert", { chatId });
     // Reuse the labels/name already extracted above for matching.
-    await insertPerson(chatId, { name, note: transcription, labels, embedding });
+    const newId = await insertPerson(chatId, { name, note: transcription, labels, embedding });
     await sendMessage(
       chatId,
-      `🙅 No similar person found — saving a new record:\n\n${formatLabels(labels)}`,
+      `🙅 No similar person found — saving a new record:\n\n${formatLabels(labels)}${
+        replyHint(newId)
+      }`,
     );
   }
+}
+
+/**
+ * A reply to one of our confirmations: merge the correction (typed text or a
+ * voice clarification) into the addressed record. Targets the record by id, so
+ * it never depends on the fuzzy match — and re-extracts labels so a pasted
+ * LinkedIn URL or phone number lands in a structured field.
+ */
+async function handleCorrection(message: TelegramMessage, personId: string): Promise<void> {
+  const chatId = message.chat.id;
+  await ensureUser(chatId);
+
+  let addition: string;
+  if (message.voice) {
+    const audio = await downloadVoice(message.voice.file_id);
+    addition = await transcribeToEnglish(audio);
+  } else {
+    addition = (message.text ?? "").trim();
+  }
+  if (!addition) {
+    await sendMessage(chatId, "I couldn't read that correction — send text or a voice note.");
+    return;
+  }
+
+  const person = await getPerson(personId, chatId);
+  if (!person) {
+    await sendMessage(chatId, "I couldn't find that record to update.");
+    return;
+  }
+  console.log("branch: correction", { chatId, personId });
+
+  const mergedNote = `${person.note}\n\n${addition}`;
+  // Apply as a field-level edit to the existing labels (so "her name is spelled
+  // Sara" replaces the name) instead of re-deriving from the merged note, which
+  // would still carry the old value. The note keeps the full history for the
+  // embedding and the dossier.
+  const mergedLabels = await applyCorrection(person.labels, addition);
+  const mergedName = personName(mergedLabels) ?? person.name;
+  const mergedEmbedding = await embed(mergedNote);
+  await updatePerson(person.id, chatId, {
+    name: mergedName,
+    note: mergedNote,
+    labels: mergedLabels,
+    embedding: mergedEmbedding,
+  });
+  await sendMessage(
+    chatId,
+    `✍️ Updated ${mergedName ?? "the record"}:\n\n${formatLabels(mergedLabels)}${
+      replyHint(person.id)
+    }`,
+  );
 }
 
 async function handleCallbackQuery(cb: TelegramCallbackQuery): Promise<void> {
@@ -158,10 +235,25 @@ async function handleCallbackQuery(cb: TelegramCallbackQuery): Promise<void> {
 async function handleUpdate(update: TelegramUpdate): Promise<void> {
   if (update.callback_query) {
     await handleCallbackQuery(update.callback_query);
-  } else if (update.message?.voice) {
-    await handleVoice(update.message);
-  } else if (update.message?.text) {
-    await handleText(update.message);
+    return;
+  }
+
+  const message = update.message;
+  if (!message) return;
+
+  // A reply to one of our record confirmations is a correction to that record.
+  // Check this first: such a reply may be a voice note or text, and either way
+  // it should edit the addressed record rather than start a new capture.
+  const replyId = extractRecordId(message.reply_to_message);
+  if (replyId && (message.voice || message.text)) {
+    await handleCorrection(message, replyId);
+    return;
+  }
+
+  if (message.voice) {
+    await handleVoice(message);
+  } else if (message.text) {
+    await handleText(message);
   }
 }
 

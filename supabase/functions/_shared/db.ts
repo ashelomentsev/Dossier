@@ -103,9 +103,7 @@ export async function matchPerson(
     bestSameName: nameMatches[0]
       ? { name: nameMatches[0].name, sim: nameMatches[0].similarity }
       : null,
-    nearest: candidates[0]
-      ? { name: candidates[0].name, sim: candidates[0].similarity }
-      : null,
+    nearest: candidates[0] ? { name: candidates[0].name, sim: candidates[0].similarity } : null,
     nameThreshold: NAME_SIM_THRESHOLD,
     simThreshold: SIM_THRESHOLD,
     reason,
@@ -122,21 +120,46 @@ interface PersonInput {
   embedding: number[];
 }
 
-export async function insertPerson(userId: number, p: PersonInput): Promise<void> {
-  const { error } = await supabase.from("people").insert({
-    user_id: userId,
-    name: p.name,
-    note: p.note,
-    labels: p.labels,
-    embedding: p.embedding,
-  });
+/** Insert a new person and return its generated id (used to address later edits). */
+export async function insertPerson(userId: number, p: PersonInput): Promise<string> {
+  const { data, error } = await supabase
+    .from("people")
+    .insert({
+      user_id: userId,
+      name: p.name,
+      note: p.note,
+      labels: p.labels,
+      embedding: p.embedding,
+    })
+    .select("id")
+    .single();
   if (error) throw error;
+  return (data as { id: string }).id;
 }
 
-export async function updatePerson(id: string, p: PersonInput): Promise<void> {
+/** Fetch a single person, scoped to its owner so one user can't read another's record. */
+export async function getPerson(id: string, userId: number): Promise<Person | null> {
+  const { data, error } = await supabase
+    .from("people")
+    .select("id, name, note, labels")
+    .eq("id", id)
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (error) throw error;
+  return (data as Person) ?? null;
+}
+
+// Scoped by user_id as well as id: a belt-and-suspenders against editing a record
+// the chat doesn't own, even though id arrives via a (non-forgeable) reply.
+export async function updatePerson(
+  id: string,
+  userId: number,
+  p: PersonInput,
+): Promise<void> {
   const { error } = await supabase
     .from("people")
     .update({ name: p.name, note: p.note, labels: p.labels, embedding: p.embedding })
-    .eq("id", id);
+    .eq("id", id)
+    .eq("user_id", userId);
   if (error) throw error;
 }
